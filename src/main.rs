@@ -191,7 +191,7 @@ fn main() {
         },
     ];
 
-    let mut tmp  = Vulkmini::init();
-    tmp.run(vertices);
+    let mut _tmp  = Vulkmini::init();
+    _tmp.run(vertices);
    
 }
