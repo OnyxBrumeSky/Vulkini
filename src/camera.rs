@@ -34,6 +34,13 @@ impl Camera {
         self.target += right * amount;
     }
 
+    /// Déplacement vertical absolu (vers le haut ou le bas) - AJOUTÉ
+    pub fn move_up(&mut self, amount: f32) {
+        let world_up = vec3(0.0, 1.0, 0.0);
+        self.eye += world_up * amount;
+        self.target += world_up * amount;
+    }
+
     pub fn rotate_yaw(&mut self, angle_radians: f32) {
         let dir = self.target - self.eye;
         let rotated_dir = rotate_y_axis(&dir, angle_radians);
@@ -41,14 +48,12 @@ impl Camera {
     }
 
     /// Rotation verticale (pitch) : regarde en haut ou en bas.
-    /// L'axe de rotation est le vecteur "right" local de la caméra.
-    /// Un clamp à ±85° empêche le flip quand on dépasse le zénith/nadir.
     pub fn rotate_pitch(&mut self, angle_radians: f32) {
         let forward = normalize(&(self.target - self.eye));
         let right = normalize(&cross(&forward, &self.up));
 
-        // Angle actuel par rapport à l'horizontale (0 = regard horizontal)
-        let current_pitch = forward.y.asin(); // ∈ [-π/2, π/2]
+        // Angle actuel par rapport à l'horizontale
+        let current_pitch = forward.y.asin();
 
         // Clamp : on ne laisse pas dépasser ±85° (1.484 radians)
         let max_pitch: f32 = 1.484;
@@ -101,22 +106,18 @@ impl LightController {
         [self.position.x, self.position.y, self.position.z, 1.0]
     }
 
-    // O / L  → déplace la lumière sur l'axe X (gauche / droite)
     pub fn move_x(&mut self, amount: f32) {
         self.position.x += amount;
     }
 
-    // K / M  → déplace la lumière sur l'axe Y (haut / bas)
     pub fn move_y(&mut self, amount: f32) {
         self.position.y += amount;
     }
 
-    // (bonus, non bindé par défaut) → axe Z
     pub fn move_z(&mut self, amount: f32) {
         self.position.z += amount;
     }
 
-    // I → augmente   P → diminue
     pub fn change_intensity(&mut self, delta: f32) {
         self.intensity = (self.intensity + delta).clamp(0.0, 3.0);
     }

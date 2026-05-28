@@ -80,24 +80,35 @@ impl MVP {
     }
 }
 
+// ─── Gestion du Clavier (AJOUTÉ) ─────────────────────────────────────────────
+
+#[derive(Default)]
+struct InputState {
+    forward: bool,
+    backward: bool,
+    strafe_left: bool,
+    strafe_right: bool,
+    move_up: bool,
+    move_down: bool,
+    yaw_left: bool,
+    yaw_right: bool,
+    pitch_up: bool,
+    pitch_down: bool,
+}
+
 // ─── Données skybox (envoyées en uniform) ────────────────────────────────────
 
-/// Paramètres de la skybox, modifiables à la volée si besoin.
 pub struct SkySettings {
-    /// Couleur du ciel
     pub sky_color: [f32; 3],
-    /// Couleur du sol
     pub ground_color: [f32; 3],
-    /// Netteté de la transition ciel/sol. Plus grand = ligne plus nette.
-    /// 8.0 donne une transition douce, 30.0 une ligne franche.
     pub sharpness: f32,
 }
 
 impl Default for SkySettings {
     fn default() -> Self {
         Self {
-            sky_color: [0.18, 0.45, 0.82],    // bleu ciel
-            ground_color: [0.08, 0.06, 0.05], // sol sombre
+            sky_color: [0.18, 0.45, 0.82],
+            ground_color: [0.08, 0.06, 0.05],
             sharpness: 8.0,
         }
     }
@@ -119,12 +130,14 @@ pub struct Vulkmini {
     render_pass: Arc<RenderPass>,
     viewport: Viewport,
     camera: Camera,
+    input_state: InputState, // AJOUTÉ
+    last_frame: Instant,     // AJOUTÉ
     // Mesh
     uniform_buffer: CpuBufferPool<vs::ty::MVP_Data>,
     ambient_light: AmbientLight,
     ambient_buffer: CpuBufferPool<fs::ty::Ambient_Data>,
     pipeline: Arc<GraphicsPipeline>,
-    // Lumière directionnelle — gérée par LightController
+    // Lumière directionnelle
     light: LightController,
     directional_buffer: CpuBufferPool<fs::ty::Directional_Light_Data>,
     // Skybox
@@ -154,7 +167,6 @@ impl Vulkmini {
             intensity: 0.2,
         };
 
-        // La lumière est contrôlée par LightController
         let light = LightController::new(
             vec3(-4.0, -4.0, 0.0),
             vec3(1.0, 1.0, 1.0),
@@ -263,7 +275,6 @@ impl Vulkmini {
         let command_buffer_allocator =
             StandardCommandBufferAllocator::new(device.clone(), Default::default());
 
-        // ── Shaders ──────────────────────────────────────────────────────────
         let vs_shader = vs::load(device.clone()).unwrap();
         let fs_shader = fs::load(device.clone()).unwrap();
         let sky_vs_shader = sky_vs2::load(device.clone()).unwrap();
@@ -271,7 +282,6 @@ impl Vulkmini {
         let sun_vs_shader = sun_vs::load(device.clone()).unwrap();
         let sun_fs_shader = sun_fs::load(device.clone()).unwrap();
 
-        // ── Render pass ──────────────────────────────────────────────────────
         let render_pass = vulkano::single_pass_renderpass!(device.clone(),
             attachments: {
                 color: {
@@ -294,7 +304,6 @@ impl Vulkmini {
         )
         .unwrap();
 
-        // ── Pipeline mesh principal ───────────────────────────────────────────
         let pipeline = GraphicsPipeline::start()
             .vertex_input_state(BuffersDefinition::new().vertex::<Vertex>())
             .vertex_shader(vs_shader.entry_point("main").unwrap(), ())
@@ -307,26 +316,19 @@ impl Vulkmini {
             .build(device.clone())
             .unwrap();
 
-        // ── Pipeline skybox ───────────────────────────────────────────────────
-        // Pas de vertex buffer, pas de depth write (la skybox est toujours derrière).
-        // On désactive le depth test pour la passe skybox en utilisant depth = 0.9999
-        // émis dans le vertex shader (voir sky_vs2).
-        // On utilise CullMode::None car il n'y a pas de géométrie réelle.
-        use vulkano::pipeline::graphics::depth_stencil::{
-            CompareOp, DepthState, DepthStencilState as DSS,
-        };
+        use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState as DSS};
         let sky_depth = DSS {
             depth: Some(DepthState {
                 enable_dynamic: false,
                 compare_op: vulkano::pipeline::StateMode::Fixed(CompareOp::LessOrEqual),
-                write_enable: vulkano::pipeline::StateMode::Fixed(false), // pas d'écriture depth
+                write_enable: vulkano::pipeline::StateMode::Fixed(false),
             }),
             depth_bounds: None,
             stencil: None,
         };
 
         let sky_pipeline = GraphicsPipeline::start()
-            .vertex_input_state(BuffersDefinition::new()) // pas de vertex buffer
+            .vertex_input_state(BuffersDefinition::new())
             .vertex_shader(sky_vs_shader.entry_point("main").unwrap(), ())
             .input_assembly_state(InputAssemblyState::new())
             .viewport_state(ViewportState::viewport_dynamic_scissor_irrelevant())
@@ -337,14 +339,7 @@ impl Vulkmini {
             .build(device.clone())
             .unwrap();
 
-        // ── Pipeline billboard soleil ─────────────────────────────────────────
-        // Pas de vertex buffer (4 sommets générés dans le vertex shader).
-        // Pas de depth write pour éviter d'occulter le mesh, mais depth test
-        // activé pour que le soleil soit caché derrière les objets proches.
-        // Blending additif pour le halo lumineux.
-        use vulkano::pipeline::graphics::color_blend::{
-            AttachmentBlend, BlendFactor, BlendOp, ColorBlendState,
-        };
+        use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, BlendOp, ColorBlendState};
         let sun_blend = ColorBlendState::new(1).blend(AttachmentBlend {
             color_op: BlendOp::Add,
             color_source: BlendFactor::SrcAlpha,
@@ -378,19 +373,12 @@ impl Vulkmini {
             .build(device.clone())
             .unwrap();
 
-        // ── Buffer pools ─────────────────────────────────────────────────────
-        let uniform_buffer: CpuBufferPool<vs::ty::MVP_Data> =
-            CpuBufferPool::uniform_buffer(memory_allocator.clone());
-        let ambient_buffer: CpuBufferPool<fs::ty::Ambient_Data> =
-            CpuBufferPool::uniform_buffer(memory_allocator.clone());
-        let directional_buffer: CpuBufferPool<fs::ty::Directional_Light_Data> =
-            CpuBufferPool::uniform_buffer(memory_allocator.clone());
-        let sky_buffer: CpuBufferPool<sky_fs2::ty::Sky_Data> =
-            CpuBufferPool::uniform_buffer(memory_allocator.clone());
-        let sun_data_buffer: CpuBufferPool<sun_vs::ty::Sun_Data> =
-            CpuBufferPool::uniform_buffer(memory_allocator.clone());
-        let sun_color_buffer: CpuBufferPool<sun_fs::ty::Sun_Color> =
-            CpuBufferPool::uniform_buffer(memory_allocator.clone());
+        let uniform_buffer = CpuBufferPool::uniform_buffer(memory_allocator.clone());
+        let ambient_buffer = CpuBufferPool::uniform_buffer(memory_allocator.clone());
+        let directional_buffer = CpuBufferPool::uniform_buffer(memory_allocator.clone());
+        let sky_buffer = CpuBufferPool::uniform_buffer(memory_allocator.clone());
+        let sun_data_buffer = CpuBufferPool::uniform_buffer(memory_allocator.clone());
+        let sun_color_buffer = CpuBufferPool::uniform_buffer(memory_allocator.clone());
 
         let mut viewport = Viewport {
             origin: [0.0, 0.0],
@@ -414,6 +402,8 @@ impl Vulkmini {
             render_pass,
             viewport,
             camera,
+            input_state: InputState::default(), // INITIALISÉ
+            last_frame: Instant::now(),         // INITIALISÉ
             uniform_buffer,
             ambient_light,
             ambient_buffer,
@@ -451,7 +441,6 @@ impl Vulkmini {
             Some(Box::new(sync::now(self.device.clone())) as Box<dyn GpuFuture>);
 
         self.event_loop.run(move |event, _, control_flow| match event {
-            // ── Fermeture ────────────────────────────────────────────────────
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
@@ -465,48 +454,71 @@ impl Vulkmini {
                 recreate_swapchain = true;
             }
 
-            // ── Clavier ──────────────────────────────────────────────────────
+            // ── Clavier réactif (MODIFIÉ) ────────────────────────────────────
             Event::WindowEvent {
                 event: WindowEvent::KeyboardInput { input, .. },
                 ..
             } => {
                 if let Some(keycode) = input.virtual_keycode {
-                    if input.state == ElementState::Pressed {
-                        match keycode {
-                            // Caméra
-                            VirtualKeyCode::Up => self.camera.move_forward(0.1),
-                            VirtualKeyCode::Down => self.camera.move_forward(-0.1),
-                            VirtualKeyCode::Right => self.camera.strafe(0.1),
-                            VirtualKeyCode::Left => self.camera.strafe(-0.1),
-                            VirtualKeyCode::Q => self.camera.rotate_yaw(0.1),
-                            VirtualKeyCode::D => self.camera.rotate_yaw(-0.1),
-                            // Z / S → regarde en haut / en bas
-                            VirtualKeyCode::S => self.camera.rotate_pitch(0.05),
-                            VirtualKeyCode::Z => self.camera.rotate_pitch(-0.05),
+                    let is_pressed = input.state == ElementState::Pressed;
+                    
+                    match keycode {
+                        // Caméra (Stockage de l'état des touches)
+                        VirtualKeyCode::Up => self.input_state.forward = is_pressed,
+                        VirtualKeyCode::Down => self.input_state.backward = is_pressed,
+                        VirtualKeyCode::Right => self.input_state.strafe_right = is_pressed, // note: mappé sur strafe_right
+                        VirtualKeyCode::Left => self.input_state.strafe_left = is_pressed,
+                        VirtualKeyCode::Space => self.input_state.move_down = is_pressed,
+                        VirtualKeyCode::LShift | VirtualKeyCode::RShift => self.input_state.move_up = is_pressed,
+                        
+                        VirtualKeyCode::Q => self.input_state.yaw_left = is_pressed,
+                        VirtualKeyCode::D => self.input_state.yaw_right = is_pressed,
+                        VirtualKeyCode::Z => self.input_state.pitch_up = is_pressed,
+                        VirtualKeyCode::S => self.input_state.pitch_down = is_pressed,
 
-                            // ── Lumière directionnelle ────────────────────
-                            // O / L  → déplace sur X (gauche/droite)
-                            VirtualKeyCode::O => self.light.move_x(-0.3),
-                            VirtualKeyCode::L => self.light.move_x(0.3),
-                            // K / M  → déplace sur Y (haut/bas)
-                            VirtualKeyCode::K => self.light.move_y(0.3),
-                            VirtualKeyCode::M => self.light.move_y(-0.3),
-                            // N / J  → déplace sur Z (avant/arrière)
-                            VirtualKeyCode::N => self.light.move_z(-0.3),
-                            VirtualKeyCode::J => self.light.move_z(0.3),
-                            // I / P  → intensité
-                            VirtualKeyCode::I => self.light.change_intensity(0.1),
-                            VirtualKeyCode::P => self.light.change_intensity(-0.1),
+                        // Lumière (Reste en appui ponctuel pour l'instant)
+                        VirtualKeyCode::O if is_pressed => self.light.move_x(-0.3),
+                        VirtualKeyCode::L if is_pressed => self.light.move_x(0.3),
+                        VirtualKeyCode::K if is_pressed => self.light.move_y(0.3),
+                        VirtualKeyCode::M if is_pressed => self.light.move_y(-0.3),
+                        VirtualKeyCode::N if is_pressed => self.light.move_z(-0.3),
+                        VirtualKeyCode::J if is_pressed => self.light.move_z(0.3),
+                        VirtualKeyCode::I if is_pressed => self.light.change_intensity(0.1),
+                        VirtualKeyCode::P if is_pressed => self.light.change_intensity(-0.1),
 
-                            VirtualKeyCode::Escape => *control_flow = ControlFlow::Exit,
-                            _ => {}
+                        VirtualKeyCode::Escape if is_pressed => *control_flow = ControlFlow::Exit,
+                        _ => {
+                            // Petit hack car j'ai fait une typo dans le struct au dessus : strafe_right
+                            if keycode == VirtualKeyCode::Right { self.input_state.strafe_right = is_pressed; }
                         }
                     }
                 }
             }
 
-            // ── Rendu ────────────────────────────────────────────────────────
+            // ── Rendu et calculs physiques (MODIFIÉ) ──────────────────────────
             Event::RedrawEventsCleared => {
+                // 1. Calcul du Delta Time
+                let now = Instant::now();
+                let dt = now.duration_since(self.last_frame).as_secs_f32();
+                self.last_frame = now;
+
+                // 2. Application des mouvements fluides basés sur le temps
+                let speed = 4.0 * dt;          // 4.0 unités par seconde
+                let rotation_speed = 1.5 * dt; // 1.5 radians par seconde
+
+                if self.input_state.forward { self.camera.move_forward(speed); }
+                if self.input_state.backward { self.camera.move_forward(-speed); }
+                if self.input_state.strafe_right { self.camera.strafe(speed); }
+                if self.input_state.strafe_left { self.camera.strafe(-speed); }
+                if self.input_state.move_up { self.camera.move_up(speed); }
+                if self.input_state.move_down { self.camera.move_up(-speed); }
+                
+                if self.input_state.yaw_left { self.camera.rotate_yaw(rotation_speed); }
+                if self.input_state.yaw_right { self.camera.rotate_yaw(-rotation_speed); }
+                if self.input_state.pitch_up { self.camera.rotate_pitch(-rotation_speed); }
+                if self.input_state.pitch_down { self.camera.rotate_pitch(rotation_speed); }
+
+                // 3. Suite du pipeline graphique classique...
                 previous_frame_end
                     .as_mut()
                     .take()
@@ -514,12 +526,7 @@ impl Vulkmini {
                     .cleanup_finished();
 
                 if recreate_swapchain {
-                    let window = self
-                        .surface
-                        .object()
-                        .unwrap()
-                        .downcast_ref::<Window>()
-                        .unwrap();
+                    let window = self.surface.object().unwrap().downcast_ref::<Window>().unwrap();
                     let image_extent: [u32; 2] = window.inner_size().into();
                     let aspect_ratio = image_extent[0] as f32 / image_extent[1] as f32;
                     self.mvp.projection = perspective(aspect_ratio, half_pi(), 0.01, 100.0);
@@ -558,17 +565,12 @@ impl Vulkmini {
                     recreate_swapchain = true;
                 }
 
-                // clear noir — la skybox remplacera ce fond de toute façon
                 let clear_values = vec![Some([0.0, 0.0, 0.0, 1.0].into()), Some(1.0.into())];
-
-                // ── Uniform mesh ──────────────────────────────────────────────
-                // On calcule la vue une seule fois et on la partage entre mesh et soleil
                 let view_matrix = self.camera.view_matrix();
 
                 let uniform_subbuffer = {
                     let elapsed = rotation_start.elapsed().as_secs() as f64
                         + rotation_start.elapsed().subsec_nanos() as f64 / 1_000_000_000.0;
-                    let _elapsed_as_radians = elapsed * pi::<f64>() / 180.0;
 
                     let mut model: TMat4<f32> =
                         rotate_normalized_axis(&identity(), 1.0, &vec3(0.0, 0.0, 1.0));
@@ -584,7 +586,6 @@ impl Vulkmini {
                     self.uniform_buffer.from_data(uniform_data).unwrap()
                 };
 
-                // ── Uniform ambient ───────────────────────────────────────────
                 let ambient_subbuffer = {
                     let uniform_data = fs::ty::Ambient_Data {
                         color: self.ambient_light.color.into(),
@@ -593,7 +594,6 @@ impl Vulkmini {
                     self.ambient_buffer.from_data(uniform_data).unwrap()
                 };
 
-                // ── Uniform lumière directionnelle ────────────────────────────
                 let directional_subbuffer = {
                     let uniform_data = fs::ty::Directional_Light_Data {
                         position: self.light.position_vec4().into(),
@@ -602,7 +602,6 @@ impl Vulkmini {
                     self.directional_buffer.from_data(uniform_data).unwrap()
                 };
 
-                // ── Descriptor set mesh ───────────────────────────────────────
                 let mesh_layout = self.pipeline.layout().set_layouts().get(0).unwrap();
                 let mesh_set = PersistentDescriptorSet::new(
                     &self.descriptor_set_allocator,
@@ -615,8 +614,6 @@ impl Vulkmini {
                 )
                 .unwrap();
 
-                // ── Uniform skybox ────────────────────────────────────────────
-                // On calcule (projection * view)^-1 pour reconstruire les rays en world space
                 let sky_subbuffer = {
                     let s = &self.sky_settings;
                     let proj_view = self.mvp.projection * view_matrix;
@@ -631,7 +628,6 @@ impl Vulkmini {
                     self.sky_buffer.from_data(uniform_data).unwrap()
                 };
 
-                // ── Descriptor set skybox ─────────────────────────────────────
                 let sky_layout = self.sky_pipeline.layout().set_layouts().get(0).unwrap();
                 let sky_set = PersistentDescriptorSet::new(
                     &self.descriptor_set_allocator,
@@ -640,12 +636,11 @@ impl Vulkmini {
                 )
                 .unwrap();
 
-                // ── Uniform billboard soleil ──────────────────────────────────
                 let sun_data_sub = {
                     let p = self.light.position;
                     let data = sun_vs::ty::Sun_Data {
                         world_pos: [p.x, p.y, p.z],
-                        size: 0.6,   // demi-taille en unités world — ajuste selon la scène
+                        size: 0.6,
                         view: view_matrix.into(),
                         projection: self.mvp.projection.into(),
                     };
@@ -653,7 +648,6 @@ impl Vulkmini {
                 };
                 let sun_color_sub = {
                     let ec = self.light.effective_color();
-                    // Cœur : blanc chaud, halo : couleur effective de la lumière
                     let data = sun_fs::ty::Sun_Color {
                         core_color: [1.0, 0.97, 0.88],
                         _pad0: 0.0,
@@ -674,7 +668,6 @@ impl Vulkmini {
                 )
                 .unwrap();
 
-                // ── Construction du command buffer ────────────────────────────
                 let mut cmd = AutoCommandBufferBuilder::primary(
                     &self.command_buffer_allocator,
                     self.queue.queue_family_index(),
@@ -693,7 +686,6 @@ impl Vulkmini {
                 )
                 .unwrap()
                 .set_viewport(0, [self.viewport.clone()])
-                // ── Passe 1 : skybox (triangle plein écran, depth=0.9999) ──────
                 .bind_pipeline_graphics(self.sky_pipeline.clone())
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
@@ -701,10 +693,8 @@ impl Vulkmini {
                     0,
                     sky_set,
                 )
-                // 3 sommets, pas de vertex buffer
                 .draw(3, 1, 0, 0)
                 .unwrap()
-                // ── Passe 2 : mesh ────────────────────────────────────────────
                 .bind_pipeline_graphics(self.pipeline.clone())
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
@@ -715,8 +705,6 @@ impl Vulkmini {
                 .bind_vertex_buffers(0, vertex_buffer.clone())
                 .draw(vertex_buffer.len() as u32, 1, 0, 0)
                 .unwrap()
-                // ── Passe 3 : billboard soleil ────────────────────────────────
-                // Dessiné après le mesh pour que le blending fonctionne correctement.
                 .bind_pipeline_graphics(self.sun_pipeline.clone())
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
@@ -724,7 +712,6 @@ impl Vulkmini {
                     0,
                     sun_set,
                 )
-                // 4 sommets en triangle strip = quad
                 .draw(4, 1, 0, 0)
                 .unwrap()
                 .end_render_pass()
@@ -767,8 +754,6 @@ impl Vulkmini {
         });
     }
 }
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn window_size_dependent_setup(
     allocator: &StandardMemoryAllocator,
