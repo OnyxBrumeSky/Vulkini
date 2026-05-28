@@ -35,7 +35,7 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
 use nalgebra_glm::{
-    half_pi, identity, perspective, pi, rotate_normalized_axis, translate, vec3, TMat4,
+    half_pi, identity, perspective, rotate_normalized_axis, translate, vec3, TMat4,
 };
 
 use std::sync::Arc;
@@ -80,7 +80,7 @@ impl MVP {
     }
 }
 
-// ─── Gestion du Clavier (AJOUTÉ) ─────────────────────────────────────────────
+// ─── Gestion du Clavier (MODIFIÉ : rotations caméras supprimées) ──────────────
 
 #[derive(Default)]
 struct InputState {
@@ -90,10 +90,17 @@ struct InputState {
     strafe_right: bool,
     move_up: bool,
     move_down: bool,
-    yaw_left: bool,
-    yaw_right: bool,
-    pitch_up: bool,
-    pitch_down: bool,
+    // (Les anciens booléens clavier de rotation caméra yaw/pitch ont été enlevés ici)
+    
+    // États pour la lumière
+    light_left: bool,
+    light_right: bool,
+    light_up: bool,
+    light_down: bool,
+    light_forward: bool,
+    light_backward: bool,
+    light_inc_intensity: bool,
+    light_dec_intensity: bool,
 }
 
 // ─── Données skybox (envoyées en uniform) ────────────────────────────────────
@@ -130,8 +137,8 @@ pub struct Vulkmini {
     render_pass: Arc<RenderPass>,
     viewport: Viewport,
     camera: Camera,
-    input_state: InputState, // AJOUTÉ
-    last_frame: Instant,     // AJOUTÉ
+    input_state: InputState, 
+    last_frame: Instant,     
     // Mesh
     uniform_buffer: CpuBufferPool<vs::ty::MVP_Data>,
     ambient_light: AmbientLight,
@@ -158,7 +165,8 @@ pub struct Vulkmini {
 impl Vulkmini {
     pub fn init() -> Self {
         let mut mvp = MVP::new();
-        let camera = Camera::new();
+        let mut camera = Camera::new();
+        camera.update_target(); // Force le premier calcul de l'axe de vision
         mvp.view = camera.view_matrix();
         mvp.model = translate(&identity(), &vec3(0.0, 0.0, -5.0));
 
@@ -191,6 +199,12 @@ impl Vulkmini {
         let surface = WindowBuilder::new()
             .build_vk_surface(&event_loop, instance.clone())
             .unwrap();
+
+        // NOUVEAU : Cache le curseur et le capture dans la fenêtre pour le mode FPS
+        if let Some(window) = surface.object().unwrap().downcast_ref::<Window>() {
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
+            window.set_cursor_visible(false);
+        }
 
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
@@ -402,8 +416,8 @@ impl Vulkmini {
             render_pass,
             viewport,
             camera,
-            input_state: InputState::default(), // INITIALISÉ
-            last_frame: Instant::now(),         // INITIALISÉ
+            input_state: InputState::default(), 
+            last_frame: Instant::now(),         
             uniform_buffer,
             ambient_light,
             ambient_buffer,
@@ -454,7 +468,16 @@ impl Vulkmini {
                 recreate_swapchain = true;
             }
 
-            // ── Clavier réactif (MODIFIÉ) ────────────────────────────────────
+            // NOUVEAU : Capture des déplacements physiques bruts de la souris (Événement natif)
+            Event::DeviceEvent {
+                event: winit::event::DeviceEvent::MouseMotion { delta },
+                ..
+            } => {
+                let sensitivity = 0.0015; // Ajustez ce coefficient pour changer la vitesse globale de la souris
+                self.camera.rotate_mouse(delta.0 as f32, delta.1 as f32, sensitivity);
+            }
+
+            // ── Clavier réactif ──────────────────────────────────────────────
             Event::WindowEvent {
                 event: WindowEvent::KeyboardInput { input, .. },
                 ..
@@ -463,49 +486,45 @@ impl Vulkmini {
                     let is_pressed = input.state == ElementState::Pressed;
                     
                     match keycode {
-                        // Caméra (Stockage de l'état des touches)
+                        // Caméra (Déplacements)
                         VirtualKeyCode::Up => self.input_state.forward = is_pressed,
                         VirtualKeyCode::Down => self.input_state.backward = is_pressed,
-                        VirtualKeyCode::Right => self.input_state.strafe_right = is_pressed, // note: mappé sur strafe_right
+                        VirtualKeyCode::Right => self.input_state.strafe_right = is_pressed,
                         VirtualKeyCode::Left => self.input_state.strafe_left = is_pressed,
                         VirtualKeyCode::Space => self.input_state.move_down = is_pressed,
                         VirtualKeyCode::LShift | VirtualKeyCode::RShift => self.input_state.move_up = is_pressed,
                         
-                        VirtualKeyCode::Q => self.input_state.yaw_left = is_pressed,
-                        VirtualKeyCode::D => self.input_state.yaw_right = is_pressed,
-                        VirtualKeyCode::Z => self.input_state.pitch_up = is_pressed,
-                        VirtualKeyCode::S => self.input_state.pitch_down = is_pressed,
+                        // (Les cas de touches de rotation de caméra clavier ont été retirés)
 
-                        // Lumière (Reste en appui ponctuel pour l'instant)
-                        VirtualKeyCode::O if is_pressed => self.light.move_x(-0.3),
-                        VirtualKeyCode::L if is_pressed => self.light.move_x(0.3),
-                        VirtualKeyCode::K if is_pressed => self.light.move_y(0.3),
-                        VirtualKeyCode::M if is_pressed => self.light.move_y(-0.3),
-                        VirtualKeyCode::N if is_pressed => self.light.move_z(-0.3),
-                        VirtualKeyCode::J if is_pressed => self.light.move_z(0.3),
-                        VirtualKeyCode::I if is_pressed => self.light.change_intensity(0.1),
-                        VirtualKeyCode::P if is_pressed => self.light.change_intensity(-0.1),
+                        // Contrôles du soleil
+                        VirtualKeyCode::O => self.input_state.light_left = is_pressed,
+                        VirtualKeyCode::L => self.input_state.light_right = is_pressed,
+                        VirtualKeyCode::K => self.input_state.light_up = is_pressed,
+                        VirtualKeyCode::M => self.input_state.light_down = is_pressed,
+                        VirtualKeyCode::N => self.input_state.light_forward = is_pressed,
+                        VirtualKeyCode::J => self.input_state.light_backward = is_pressed,
+                        VirtualKeyCode::I => self.input_state.light_inc_intensity = is_pressed,
+                        VirtualKeyCode::P => self.input_state.light_dec_intensity = is_pressed,
 
                         VirtualKeyCode::Escape if is_pressed => *control_flow = ControlFlow::Exit,
-                        _ => {
-                            // Petit hack car j'ai fait une typo dans le struct au dessus : strafe_right
-                            if keycode == VirtualKeyCode::Right { self.input_state.strafe_right = is_pressed; }
-                        }
+                        _ => {}
                     }
                 }
             }
 
-            // ── Rendu et calculs physiques (MODIFIÉ) ──────────────────────────
+            // ── Rendu et mises à jour continues ──────────────────────────────
             Event::RedrawEventsCleared => {
                 // 1. Calcul du Delta Time
                 let now = Instant::now();
                 let dt = now.duration_since(self.last_frame).as_secs_f32();
                 self.last_frame = now;
 
-                // 2. Application des mouvements fluides basés sur le temps
-                let speed = 4.0 * dt;          // 4.0 unités par seconde
-                let rotation_speed = 1.5 * dt; // 1.5 radians par seconde
+                // 2. Vitesses basées sur le temps
+                let speed = 4.0 * dt;          
+                let light_speed = 5.0 * dt;           
+                let light_intensity_speed = 2.0 * dt; 
 
+                // Mouvements Caméra
                 if self.input_state.forward { self.camera.move_forward(speed); }
                 if self.input_state.backward { self.camera.move_forward(-speed); }
                 if self.input_state.strafe_right { self.camera.strafe(speed); }
@@ -513,12 +532,20 @@ impl Vulkmini {
                 if self.input_state.move_up { self.camera.move_up(speed); }
                 if self.input_state.move_down { self.camera.move_up(-speed); }
                 
-                if self.input_state.yaw_left { self.camera.rotate_yaw(rotation_speed); }
-                if self.input_state.yaw_right { self.camera.rotate_yaw(-rotation_speed); }
-                if self.input_state.pitch_up { self.camera.rotate_pitch(-rotation_speed); }
-                if self.input_state.pitch_down { self.camera.rotate_pitch(rotation_speed); }
+                // NOUVEAU : Recalcule la cible de visée à chaque déplacement pour éviter la dérive
+                self.camera.update_target();
 
-                // 3. Suite du pipeline graphique classique...
+                // Mouvements Soleil
+                if self.input_state.light_left { self.light.move_x(-light_speed); }
+                if self.input_state.light_right { self.light.move_x(light_speed); }
+                if self.input_state.light_up { self.light.move_y(light_speed); }
+                if self.input_state.light_down { self.light.move_y(-light_speed); }
+                if self.input_state.light_forward { self.light.move_z(-light_speed); }
+                if self.input_state.light_backward { self.light.move_z(light_speed); }
+                if self.input_state.light_inc_intensity { self.light.change_intensity(light_intensity_speed); }
+                if self.input_state.light_dec_intensity { self.light.change_intensity(-light_intensity_speed); }
+
+                // 3. Pipeline graphique
                 previous_frame_end
                     .as_mut()
                     .take()
@@ -569,9 +596,6 @@ impl Vulkmini {
                 let view_matrix = self.camera.view_matrix();
 
                 let uniform_subbuffer = {
-                    let elapsed = rotation_start.elapsed().as_secs() as f64
-                        + rotation_start.elapsed().subsec_nanos() as f64 / 1_000_000_000.0;
-
                     let mut model: TMat4<f32> =
                         rotate_normalized_axis(&identity(), 1.0, &vec3(0.0, 0.0, 1.0));
                     model = rotate_normalized_axis(&model, 1.0, &vec3(0.0, 1.0, 0.0));

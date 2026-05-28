@@ -6,6 +6,9 @@ pub struct Camera {
     pub eye: Vec3,
     pub target: Vec3,
     pub up: Vec3,
+    // NOUVEAU : Suivi des angles pour la gestion fluide à la souris
+    pub yaw: f32,
+    pub pitch: f32,
 }
 
 impl Camera {
@@ -14,11 +17,24 @@ impl Camera {
             eye: vec3(0.0, 0.0, 0.5),
             target: vec3(0.0, 0.0, 0.0),
             up: vec3(0.0, 1.0, 0.0),
+            // NOUVEAU : Initialisation à -90 degrés sur l'axe Y pour regarder vers -Z par défaut
+            yaw: -std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
         }
     }
 
     pub fn view_matrix(&self) -> TMat4<f32> {
         look_at(&self.eye, &self.target, &self.up)
+    }
+
+    // NOUVEAU : Recalcule le vecteur cible (target) basé sur les angles yaw/pitch et la position de l'œil
+    pub fn update_target(&mut self) {
+        let front = vec3(
+            self.yaw.cos() * self.pitch.cos(),
+            self.pitch.sin(),
+            self.yaw.sin() * self.pitch.cos(),
+        );
+        self.target = self.eye + normalize(&front);
     }
 
     pub fn move_forward(&mut self, amount: f32) {
@@ -34,47 +50,24 @@ impl Camera {
         self.target += right * amount;
     }
 
-    /// Déplacement vertical absolu (vers le haut ou le bas) - AJOUTÉ
+    /// Déplacement vertical absolu (vers le haut ou le bas)
     pub fn move_up(&mut self, amount: f32) {
         let world_up = vec3(0.0, 1.0, 0.0);
         self.eye += world_up * amount;
         self.target += world_up * amount;
     }
 
-    pub fn rotate_yaw(&mut self, angle_radians: f32) {
-        let dir = self.target - self.eye;
-        let rotated_dir = rotate_y_axis(&dir, angle_radians);
-        self.target = self.eye + rotated_dir;
-    }
+    // NOUVEAU : Calcule l'orientation à partir des mouvements relatifs de la souris
+    pub fn rotate_mouse(&mut self, delta_x: f32, delta_y: f32, sensitivity: f32) {
+        self.yaw += delta_x * sensitivity;
+        self.pitch += delta_y * sensitivity; // Inversé pour que glisser la souris vers le haut lève les yeux
 
-    /// Rotation verticale (pitch) : regarde en haut ou en bas.
-    pub fn rotate_pitch(&mut self, angle_radians: f32) {
-        let forward = normalize(&(self.target - self.eye));
-        let right = normalize(&cross(&forward, &self.up));
-
-        // Angle actuel par rapport à l'horizontale
-        let current_pitch = forward.y.asin();
-
-        // Clamp : on ne laisse pas dépasser ±85° (1.484 radians)
+        // Limite le pitch à ~85 degrés pour éviter que la caméra ne se retourne complètement
         let max_pitch: f32 = 1.484;
-        let new_pitch = (current_pitch + angle_radians).clamp(-max_pitch, max_pitch);
-        let delta = new_pitch - current_pitch;
+        self.pitch = self.pitch.clamp(-max_pitch, max_pitch);
 
-        if delta.abs() < 1e-6 {
-            return;
-        }
-
-        let rot = rotation(delta, &right);
-        let dir = self.target - self.eye;
-        let rotated = (rot * dir.push(1.0)).xyz();
-        self.target = self.eye + rotated;
+        self.update_target();
     }
-}
-
-pub fn rotate_y_axis(vector: &Vec3, angle: f32) -> Vec3 {
-    let rot_matrix = rotation(angle, &vec3(0.0, 1.0, 0.0));
-    let ve4 = vector.push(1.0);
-    (rot_matrix * ve4).xyz()
 }
 
 // ─── Lumière directionnelle ───────────────────────────────────────────────────
