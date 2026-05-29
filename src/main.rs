@@ -1,8 +1,9 @@
-use vulkini::vulkini::{Vulkmini, Vertex};
+use vulkini::vulkini::{Vulkmini, Vertex, SceneObject};
+use nalgebra_glm::{translate, identity, vec3};
 
 fn main() {
 
-    let vertices = vec![
+    let cube_vertices = vec![
         // front face
         Vertex {
             position: [-1.000000, -1.000000, 1.000000],
@@ -191,7 +192,28 @@ fn main() {
         },
     ];
 
-    let mut _tmp  = Vulkmini::init();
-    _tmp.run(vertices);
+    // ─── Scène : ajoute autant d'objets que tu veux ────────────────────────────
+    let objects = vec![
+        // Cube central, tourne lentement
+        SceneObject::new(
+            cube_vertices.clone(),
+            translate(&identity(), &vec3(0.0, 0.0, -5.0)),
+        ).with_rotation(0.8),
+
+        // Deuxième cube à droite, tourne plus vite
+        SceneObject::new(
+            cube_vertices.clone(),
+            translate(&identity(), &vec3(4.0, 0.0, -5.0)),
+        ).with_rotation(1.5),
+
+        // Troisième cube à gauche, statique
+        SceneObject::new(
+            cube_vertices.clone(),
+            translate(&identity(), &vec3(-4.0, 1.0, -7.0)),
+        ),
+    ];
+
+    let mut _tmp = Vulkmini::init();
+    _tmp.run(objects);
    
 }

@@ -55,6 +55,25 @@ pub struct Vertex {
 }
 vulkano::impl_vertex!(Vertex, position, normal, color);
 
+// ─── Objet de scène ───────────────────────────────────────────────────────────
+
+pub struct SceneObject {
+    pub vertices: Vec<Vertex>,
+    pub base_transform: TMat4<f32>,
+    pub rotation_speed: f32, // radians/s autour de Y, 0.0 = statique
+}
+
+impl SceneObject {
+    pub fn new(vertices: Vec<Vertex>, base_transform: TMat4<f32>) -> Self {
+        Self { vertices, base_transform, rotation_speed: 0.0 }
+    }
+
+    pub fn with_rotation(mut self, speed: f32) -> Self {
+        self.rotation_speed = speed;
+        self
+    }
+}
+
 // ─── Uniformes internes ───────────────────────────────────────────────────────
 
 #[derive(Default, Debug, Clone)]
@@ -437,17 +456,20 @@ impl Vulkmini {
         }
     }
 
-    pub fn run(mut self, vertices: Vec<Vertex>) {
-        let vertex_buffer = CpuAccessibleBuffer::from_iter(
-            &self.memory_allocator,
-            BufferUsage {
-                vertex_buffer: true,
-                ..BufferUsage::empty()
-            },
-            false,
-            vertices,
-        )
-        .unwrap();
+    pub fn run(mut self, objects: Vec<SceneObject>) {
+        // Créer un vertex buffer par objet
+        let vertex_buffers: Vec<Arc<CpuAccessibleBuffer<[Vertex]>>> = objects
+            .iter()
+            .map(|obj| {
+                CpuAccessibleBuffer::from_iter(
+                    &self.memory_allocator,
+                    BufferUsage { vertex_buffer: true, ..BufferUsage::empty() },
+                    false,
+                    obj.vertices.iter().cloned(),
+                )
+                .unwrap()
+            })
+            .collect();
 
         let mut recreate_swapchain = false;
         let rotation_start = Instant::now();
@@ -595,21 +617,6 @@ impl Vulkmini {
                 let clear_values = vec![Some([0.0, 0.0, 0.0, 1.0].into()), Some(1.0.into())];
                 let view_matrix = self.camera.view_matrix();
 
-                let uniform_subbuffer = {
-                    let mut model: TMat4<f32> =
-                        rotate_normalized_axis(&identity(), 1.0, &vec3(0.0, 0.0, 1.0));
-                    model = rotate_normalized_axis(&model, 1.0, &vec3(0.0, 1.0, 0.0));
-                    model = rotate_normalized_axis(&model, 1.0, &vec3(1.0, 0.0, 0.0));
-                    model = self.mvp.model * model;
-
-                    let uniform_data = vs::ty::MVP_Data {
-                        model: model.into(),
-                        view: view_matrix.into(),
-                        projection: self.mvp.projection.into(),
-                    };
-                    self.uniform_buffer.from_data(uniform_data).unwrap()
-                };
-
                 let ambient_subbuffer = {
                     let uniform_data = fs::ty::Ambient_Data {
                         color: self.ambient_light.color.into(),
@@ -626,17 +633,7 @@ impl Vulkmini {
                     self.directional_buffer.from_data(uniform_data).unwrap()
                 };
 
-                let mesh_layout = self.pipeline.layout().set_layouts().get(0).unwrap();
-                let mesh_set = PersistentDescriptorSet::new(
-                    &self.descriptor_set_allocator,
-                    mesh_layout.clone(),
-                    [
-                        WriteDescriptorSet::buffer(0, uniform_subbuffer),
-                        WriteDescriptorSet::buffer(1, ambient_subbuffer),
-                        WriteDescriptorSet::buffer(2, directional_subbuffer),
-                    ],
-                )
-                .unwrap();
+                let mesh_layout = self.pipeline.layout().set_layouts().get(0).unwrap().clone();
 
                 let sky_subbuffer = {
                     let s = &self.sky_settings;
@@ -709,6 +706,7 @@ impl Vulkmini {
                     SubpassContents::Inline,
                 )
                 .unwrap()
+                // ── Skybox ──────────────────────────────────────────────────
                 .set_viewport(0, [self.viewport.clone()])
                 .bind_pipeline_graphics(self.sky_pipeline.clone())
                 .bind_descriptor_sets(
@@ -719,16 +717,48 @@ impl Vulkmini {
                 )
                 .draw(3, 1, 0, 0)
                 .unwrap()
-                .bind_pipeline_graphics(self.pipeline.clone())
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    self.pipeline.layout().clone(),
-                    0,
-                    mesh_set,
-                )
-                .bind_vertex_buffers(0, vertex_buffer.clone())
-                .draw(vertex_buffer.len() as u32, 1, 0, 0)
-                .unwrap()
+                // ── Mesh pipeline (partagé entre tous les objets) ───────────
+                .bind_pipeline_graphics(self.pipeline.clone());
+
+                // ── Draw call par objet de scène ────────────────────────────
+                let elapsed = rotation_start.elapsed().as_secs_f32();
+                for (obj, vbuf) in objects.iter().zip(vertex_buffers.iter()) {
+                    let angle = elapsed * obj.rotation_speed;
+                    let model = rotate_normalized_axis(&obj.base_transform, angle, &vec3(0.0, 1.0, 0.0));
+
+                    let uniform_subbuffer = {
+                        let uniform_data = vs::ty::MVP_Data {
+                            model: model.into(),
+                            view: view_matrix.into(),
+                            projection: self.mvp.projection.into(),
+                        };
+                        self.uniform_buffer.from_data(uniform_data).unwrap()
+                    };
+
+                    let mesh_set = PersistentDescriptorSet::new(
+                        &self.descriptor_set_allocator,
+                        mesh_layout.clone(),
+                        [
+                            WriteDescriptorSet::buffer(0, uniform_subbuffer),
+                            WriteDescriptorSet::buffer(1, ambient_subbuffer.clone()),
+                            WriteDescriptorSet::buffer(2, directional_subbuffer.clone()),
+                        ],
+                    )
+                    .unwrap();
+
+                    cmd.bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            self.pipeline.layout().clone(),
+                            0,
+                            mesh_set,
+                        )
+                        .bind_vertex_buffers(0, vbuf.clone())
+                        .draw(vbuf.len() as u32, 1, 0, 0)
+                        .unwrap();
+                }
+
+                // ── Billboard soleil ────────────────────────────────────────
+                cmd
                 .bind_pipeline_graphics(self.sun_pipeline.clone())
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
