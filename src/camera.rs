@@ -38,10 +38,18 @@ impl Camera {
     }
 
     pub fn move_forward(&mut self, amount: f32) {
-        let dir = normalize(&(self.target - self.eye));
+        let mut dir = normalize(&(self.target - self.eye));
+        dir.y = 0.0;
+        let dir = normalize(&dir); // renormalise après avoir mis Y à zéro
         self.eye += dir * amount;
         self.target += dir * amount;
     }
+
+    // pub fn move_forward(&mut self, amount: f32) {
+    //     let dir = normalize(&(self.target - self.eye));
+    //     self.eye += dir * amount;
+    //     self.target += dir * amount;
+    // }
 
     pub fn strafe(&mut self, amount: f32) {
         let dir = normalize(&(self.target - self.eye));

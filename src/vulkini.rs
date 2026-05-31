@@ -11,7 +11,9 @@ use vulkano::device::physical::PhysicalDeviceType;
 use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo};
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
-use vulkano::image::{AttachmentImage, ImageAccess, SwapchainImage};
+use vulkano::image::{
+    AttachmentImage, ImageAccess, ImmutableImage, MipmapsCount, SwapchainImage,
+};
 use vulkano::instance::{Instance, InstanceCreateInfo};
 use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::graphics::depth_stencil::DepthStencilState;
@@ -21,6 +23,7 @@ use vulkano::pipeline::graphics::vertex_input::BuffersDefinition;
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::{GraphicsPipeline, Pipeline, PipelineBindPoint};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
+use vulkano::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::swapchain::{
     self, AcquireError, Surface, Swapchain, SwapchainCreateInfo, SwapchainCreationError,
     SwapchainPresentInfo,
@@ -52,24 +55,42 @@ pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 3],
+    pub tex_coords: [f32; 2], // NOUVEAU : coordonnées UV pour les textures
 }
-vulkano::impl_vertex!(Vertex, position, normal, color);
+vulkano::impl_vertex!(Vertex, position, normal, color, tex_coords);
+
+// ─── Texture chargée sur le GPU ───────────────────────────────────────────────
+
+/// Une texture prête à l'emploi pour être passée à SceneObject.
+/// Créez-la via `Vulkmini::load_texture(path)` avant d'appeler `run()`.
+pub struct GpuTexture {
+    pub view: Arc<ImageView<ImmutableImage>>,
+    pub sampler: Arc<Sampler>,
+}
 
 // ─── Objet de scène ───────────────────────────────────────────────────────────
 
 pub struct SceneObject {
     pub vertices: Vec<Vertex>,
     pub base_transform: TMat4<f32>,
-    pub rotation_speed: f32, // radians/s autour de Y, 0.0 = statique
+    pub rotation_speed: f32,
+    /// Texture optionnelle. None → couleur unie (comportement original).
+    pub texture: Option<Arc<GpuTexture>>,
 }
 
 impl SceneObject {
     pub fn new(vertices: Vec<Vertex>, base_transform: TMat4<f32>) -> Self {
-        Self { vertices, base_transform, rotation_speed: 0.0 }
+        Self { vertices, base_transform, rotation_speed: 0.0, texture: None }
     }
 
     pub fn with_rotation(mut self, speed: f32) -> Self {
         self.rotation_speed = speed;
+        self
+    }
+
+    /// Assigne une texture à cet objet.
+    pub fn with_texture(mut self, tex: Arc<GpuTexture>) -> Self {
+        self.texture = Some(tex);
         self
     }
 }
@@ -99,7 +120,7 @@ impl MVP {
     }
 }
 
-// ─── Gestion du Clavier (MODIFIÉ : rotations caméras supprimées) ──────────────
+// ─── Gestion du Clavier ──────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct InputState {
@@ -109,9 +130,6 @@ struct InputState {
     strafe_right: bool,
     move_up: bool,
     move_down: bool,
-    // (Les anciens booléens clavier de rotation caméra yaw/pitch ont été enlevés ici)
-    
-    // États pour la lumière
     light_left: bool,
     light_right: bool,
     light_up: bool,
@@ -122,7 +140,7 @@ struct InputState {
     light_dec_intensity: bool,
 }
 
-// ─── Données skybox (envoyées en uniform) ────────────────────────────────────
+// ─── Données skybox ──────────────────────────────────────────────────────────
 
 pub struct SkySettings {
     pub sky_color: [f32; 3],
@@ -140,6 +158,8 @@ impl Default for SkySettings {
     }
 }
 
+
+
 // ─── Structure principale ────────────────────────────────────────────────────
 
 pub struct Vulkmini {
@@ -156,8 +176,8 @@ pub struct Vulkmini {
     render_pass: Arc<RenderPass>,
     viewport: Viewport,
     camera: Camera,
-    input_state: InputState, 
-    last_frame: Instant,     
+    input_state: InputState,
+    last_frame: Instant,
     // Mesh
     uniform_buffer: CpuBufferPool<vs::ty::MVP_Data>,
     ambient_light: AmbientLight,
@@ -174,6 +194,8 @@ pub struct Vulkmini {
     sun_pipeline: Arc<GraphicsPipeline>,
     sun_data_buffer: CpuBufferPool<sun_vs::ty::Sun_Data>,
     sun_color_buffer: CpuBufferPool<sun_fs::ty::Sun_Color>,
+    // Texture blanche par défaut (fallback)
+    white_texture: Arc<GpuTexture>,
     // Infrastructure
     queue: Arc<Queue>,
     device: Arc<Device>,
@@ -185,7 +207,7 @@ impl Vulkmini {
     pub fn init() -> Self {
         let mut mvp = MVP::new();
         let mut camera = Camera::new();
-        camera.update_target(); // Force le premier calcul de l'axe de vision
+        camera.update_target();
         mvp.view = camera.view_matrix();
         mvp.model = translate(&identity(), &vec3(0.0, 0.0, -5.0));
 
@@ -219,7 +241,6 @@ impl Vulkmini {
             .build_vk_surface(&event_loop, instance.clone())
             .unwrap();
 
-        // NOUVEAU : Cache le curseur et le capture dans la fenêtre pour le mode FPS
         if let Some(window) = surface.object().unwrap().downcast_ref::<Window>() {
             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
             window.set_cursor_visible(false);
@@ -413,6 +434,14 @@ impl Vulkmini {
         let sun_data_buffer = CpuBufferPool::uniform_buffer(memory_allocator.clone());
         let sun_color_buffer = CpuBufferPool::uniform_buffer(memory_allocator.clone());
 
+        // ── Texture blanche 1×1 (fallback pour les objets sans texture) ──────
+        let white_texture = Self::load_white_texture(
+            &memory_allocator,
+            queue.clone(),
+            &command_buffer_allocator,
+            &device,
+        );
+
         let mut viewport = Viewport {
             origin: [0.0, 0.0],
             dimensions: [0.0, 0.0],
@@ -435,8 +464,8 @@ impl Vulkmini {
             render_pass,
             viewport,
             camera,
-            input_state: InputState::default(), 
-            last_frame: Instant::now(),         
+            input_state: InputState::default(),
+            last_frame: Instant::now(),
             uniform_buffer,
             ambient_light,
             ambient_buffer,
@@ -448,6 +477,7 @@ impl Vulkmini {
             sun_pipeline,
             sun_data_buffer,
             sun_color_buffer,
+            white_texture,
             pipeline,
             queue,
             device,
@@ -456,8 +486,118 @@ impl Vulkmini {
         }
     }
 
+    // ── Chargement d'une texture depuis un fichier PNG/JPG ────────────────────
+    //
+    // Appelez cette méthode AVANT `run()` pour obtenir un Arc<GpuTexture>
+    // à passer à SceneObject::with_texture().
+    //
+    // Exemple :
+    //   let tex = app.load_texture("assets/brick.png");
+    //   let obj = SceneObject::new(verts, transform).with_texture(tex);
+    //
+    pub fn load_texture(&self, path: &str) -> Arc<GpuTexture> {
+        // Décodage du fichier image avec la crate `image`
+        let img = image::open(path)
+            .unwrap_or_else(|e| panic!("Impossible d'ouvrir la texture '{}' : {}", path, e))
+            .into_rgba8();
+
+        let (width, height) = img.dimensions();
+        let rgba_data: Vec<u8> = img.into_raw();
+
+        // Upload vers le GPU via un command buffer one-shot
+        let mut upload_cmd = AutoCommandBufferBuilder::primary(
+            &self.command_buffer_allocator,
+            self.queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        let gpu_image = ImmutableImage::from_iter(
+            &self.memory_allocator,
+            rgba_data,
+            vulkano::image::ImageDimensions::Dim2d { width, height, array_layers: 1 },
+            MipmapsCount::One,
+            Format::R8G8B8A8_UNORM,
+            &mut upload_cmd,
+        )
+        .unwrap();
+
+        // Exécution du command buffer de transfert
+        let upload_cmd = upload_cmd.build().unwrap();
+        sync::now(self.device.clone())
+            .then_execute(self.queue.clone(), upload_cmd)
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None)
+            .unwrap();
+
+        let view = ImageView::new_default(gpu_image).unwrap();
+        let sampler = Sampler::new(
+            self.device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Nearest,
+                min_filter: Filter::Nearest,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        Arc::new(GpuTexture { view, sampler })
+    }
+
+    // ── Texture blanche interne (1×1, utilisée quand pas de texture) ──────────
+    fn load_white_texture(
+        memory_allocator: &StandardMemoryAllocator,
+        queue: Arc<Queue>,
+        cmd_alloc: &StandardCommandBufferAllocator,
+        device: &Arc<Device>,
+    ) -> Arc<GpuTexture> {
+        let pixels: Vec<u8> = vec![255, 255, 255, 255];
+
+        let mut upload_cmd = AutoCommandBufferBuilder::primary(
+            cmd_alloc,
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        let gpu_image = ImmutableImage::from_iter(
+            memory_allocator,
+            pixels,
+            vulkano::image::ImageDimensions::Dim2d { width: 1, height: 1, array_layers: 1 },
+            MipmapsCount::One,
+            Format::R8G8B8A8_UNORM,
+            &mut upload_cmd,
+        )
+        .unwrap();
+
+        let upload_cmd = upload_cmd.build().unwrap();
+        sync::now(device.clone())
+            .then_execute(queue.clone(), upload_cmd)
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None)
+            .unwrap();
+
+        let view = ImageView::new_default(gpu_image).unwrap();
+        let sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Nearest,
+                min_filter: Filter::Nearest,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        Arc::new(GpuTexture { view, sampler })
+    }
+
     pub fn run(mut self, objects: Vec<SceneObject>) {
-        // Créer un vertex buffer par objet
         let vertex_buffers: Vec<Arc<CpuAccessibleBuffer<[Vertex]>>> = objects
             .iter()
             .map(|obj| {
@@ -490,35 +630,27 @@ impl Vulkmini {
                 recreate_swapchain = true;
             }
 
-            // NOUVEAU : Capture des déplacements physiques bruts de la souris (Événement natif)
             Event::DeviceEvent {
                 event: winit::event::DeviceEvent::MouseMotion { delta },
                 ..
             } => {
-                let sensitivity = 0.0015; // Ajustez ce coefficient pour changer la vitesse globale de la souris
+                let sensitivity = 0.0015;
                 self.camera.rotate_mouse(delta.0 as f32, delta.1 as f32, sensitivity);
             }
 
-            // ── Clavier réactif ──────────────────────────────────────────────
             Event::WindowEvent {
                 event: WindowEvent::KeyboardInput { input, .. },
                 ..
             } => {
                 if let Some(keycode) = input.virtual_keycode {
                     let is_pressed = input.state == ElementState::Pressed;
-                    
                     match keycode {
-                        // Caméra (Déplacements)
                         VirtualKeyCode::Up => self.input_state.forward = is_pressed,
                         VirtualKeyCode::Down => self.input_state.backward = is_pressed,
                         VirtualKeyCode::Right => self.input_state.strafe_right = is_pressed,
                         VirtualKeyCode::Left => self.input_state.strafe_left = is_pressed,
                         VirtualKeyCode::Space => self.input_state.move_down = is_pressed,
                         VirtualKeyCode::LShift | VirtualKeyCode::RShift => self.input_state.move_up = is_pressed,
-                        
-                        // (Les cas de touches de rotation de caméra clavier ont été retirés)
-
-                        // Contrôles du soleil
                         VirtualKeyCode::O => self.input_state.light_left = is_pressed,
                         VirtualKeyCode::L => self.input_state.light_right = is_pressed,
                         VirtualKeyCode::K => self.input_state.light_up = is_pressed,
@@ -527,37 +659,29 @@ impl Vulkmini {
                         VirtualKeyCode::J => self.input_state.light_backward = is_pressed,
                         VirtualKeyCode::I => self.input_state.light_inc_intensity = is_pressed,
                         VirtualKeyCode::P => self.input_state.light_dec_intensity = is_pressed,
-
                         VirtualKeyCode::Escape if is_pressed => *control_flow = ControlFlow::Exit,
                         _ => {}
                     }
                 }
             }
 
-            // ── Rendu et mises à jour continues ──────────────────────────────
             Event::RedrawEventsCleared => {
-                // 1. Calcul du Delta Time
                 let now = Instant::now();
                 let dt = now.duration_since(self.last_frame).as_secs_f32();
                 self.last_frame = now;
 
-                // 2. Vitesses basées sur le temps
-                let speed = 4.0 * dt;          
-                let light_speed = 5.0 * dt;           
-                let light_intensity_speed = 2.0 * dt; 
+                let speed = 4.0 * dt;
+                let light_speed = 5.0 * dt;
+                let light_intensity_speed = 2.0 * dt;
 
-                // Mouvements Caméra
                 if self.input_state.forward { self.camera.move_forward(speed); }
                 if self.input_state.backward { self.camera.move_forward(-speed); }
                 if self.input_state.strafe_right { self.camera.strafe(speed); }
                 if self.input_state.strafe_left { self.camera.strafe(-speed); }
                 if self.input_state.move_up { self.camera.move_up(speed); }
                 if self.input_state.move_down { self.camera.move_up(-speed); }
-                
-                // NOUVEAU : Recalcule la cible de visée à chaque déplacement pour éviter la dérive
                 self.camera.update_target();
 
-                // Mouvements Soleil
                 if self.input_state.light_left { self.light.move_x(-light_speed); }
                 if self.input_state.light_right { self.light.move_x(light_speed); }
                 if self.input_state.light_up { self.light.move_y(light_speed); }
@@ -567,12 +691,7 @@ impl Vulkmini {
                 if self.input_state.light_inc_intensity { self.light.change_intensity(light_intensity_speed); }
                 if self.input_state.light_dec_intensity { self.light.change_intensity(-light_intensity_speed); }
 
-                // 3. Pipeline graphique
-                previous_frame_end
-                    .as_mut()
-                    .take()
-                    .unwrap()
-                    .cleanup_finished();
+                previous_frame_end.as_mut().take().unwrap().cleanup_finished();
 
                 if recreate_swapchain {
                     let window = self.surface.object().unwrap().downcast_ref::<Window>().unwrap();
@@ -610,9 +729,7 @@ impl Vulkmini {
                         Err(e) => panic!("Failed to acquire next image: {:?}", e),
                     };
 
-                if suboptimal {
-                    recreate_swapchain = true;
-                }
+                if suboptimal { recreate_swapchain = true; }
 
                 let clear_values = vec![Some([0.0, 0.0, 0.0, 1.0].into()), Some(1.0.into())];
                 let view_matrix = self.camera.view_matrix();
@@ -717,10 +834,9 @@ impl Vulkmini {
                 )
                 .draw(3, 1, 0, 0)
                 .unwrap()
-                // ── Mesh pipeline (partagé entre tous les objets) ───────────
+                // ── Mesh pipeline ───────────────────────────────────────────
                 .bind_pipeline_graphics(self.pipeline.clone());
 
-                // ── Draw call par objet de scène ────────────────────────────
                 let elapsed = rotation_start.elapsed().as_secs_f32();
                 for (obj, vbuf) in objects.iter().zip(vertex_buffers.iter()) {
                     let angle = elapsed * obj.rotation_speed;
@@ -735,6 +851,9 @@ impl Vulkmini {
                         self.uniform_buffer.from_data(uniform_data).unwrap()
                     };
 
+                    // Texture : utilise celle de l'objet ou la blanche par défaut
+                    let tex = obj.texture.as_ref().unwrap_or(&self.white_texture);
+
                     let mesh_set = PersistentDescriptorSet::new(
                         &self.descriptor_set_allocator,
                         mesh_layout.clone(),
@@ -742,6 +861,12 @@ impl Vulkmini {
                             WriteDescriptorSet::buffer(0, uniform_subbuffer),
                             WriteDescriptorSet::buffer(1, ambient_subbuffer.clone()),
                             WriteDescriptorSet::buffer(2, directional_subbuffer.clone()),
+                            // binding 3 : sampler + image de la texture
+                            WriteDescriptorSet::image_view_sampler(
+                                3,
+                                tex.view.clone(),
+                                tex.sampler.clone(),
+                            ),
                         ],
                     )
                     .unwrap();
