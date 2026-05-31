@@ -1,8 +1,25 @@
-use vulkini::vulkini::{Vulkmini, Vertex, SceneObject};
-use nalgebra_glm::{translate, identity, vec3};
-use std::sync::Arc;
+// src/main.rs
+
+// Déclarations des modules internes du moteur
+mod camera;
+mod shader;
+mod ui;
+mod ui_shader;
+mod input;
+mod texture;
+mod scene_object;
+mod renderer;
+
+use nalgebra_glm::{identity, translate, vec3};
+use winit::event_loop::EventLoop;
+
+// Importation de tes structures depuis les modules nettoyés
+use crate::scene_object::{SceneObject, Vertex};
+use crate::renderer::Vulkmini;
 
 fn main() {
+    // 1. Initialisation de la boucle d'événements winit requise par Vulkano
+    let event_loop = EventLoop::new();
 
     // UV mapping standard pour un cube (2 triangles par face)
     // Les coordonnées UV couvrent [0,1]x[0,1] sur chaque face.
@@ -52,19 +69,11 @@ fn main() {
     ];
 
     // ─── Init du renderer ─────────────────────────────────────────────────────
-    let mut app = Vulkmini::init();
+    // On transmet désormais la référence de la boucle d'événements à l'initialisation
+    let app = Vulkmini::init(&event_loop);
 
     // ─── Chargement des textures ──────────────────────────────────────────────
-    // Chargez vos PNG/JPG ici via app.load_texture("chemin/vers/fichier.png").
-    // La méthode retourne un Arc<GpuTexture> à passer à with_texture().
-    //
-    // Exemple :
-    //   let brique = Arc::new(app.load_texture("assets/brique.png"));
-    //
-    // Les objets sans texture utilisent automatiquement une texture blanche
-    // (la couleur du vertex s'applique seule, comportement identique à avant).
-
-    let ma_texture = app.load_texture("textures/cobblestone.png"); // ← adaptez le chemin
+    let ma_texture = app.load_texture("textures/cobblestone.png");
 
     // ─── Scène ────────────────────────────────────────────────────────────────
     let objects = vec![
@@ -86,10 +95,12 @@ fn main() {
 
         // Troisième cube sans texture → couleur unie (blanc × vertex color)
         SceneObject::new(
-            cube_vertices.clone(),
+            cube_vertices,
             translate(&identity(), &vec3(-4.0, 1.0, -7.0)),
         ),
     ];
 
-    app.run(objects);
+    // ─── Exécution ────────────────────────────────────────────────────────────
+    // La boucle d'événements est transmise en paramètre pour ouvrir et gérer la fenêtre
+    app.run(event_loop, objects);
 }
